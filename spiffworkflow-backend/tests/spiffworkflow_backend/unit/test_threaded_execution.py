@@ -1,10 +1,10 @@
 from flask import Flask
 from flask.testing import FlaskClient
+
 from spiffworkflow_backend.models.process_instance import ProcessInstanceModel
 from spiffworkflow_backend.models.task import TaskModel
 from spiffworkflow_backend.models.user import UserModel
 from spiffworkflow_backend.services.process_instance_processor import ProcessInstanceProcessor
-
 from tests.spiffworkflow_backend.helpers.base_test import BaseTest
 from tests.spiffworkflow_backend.helpers.test_data import load_test_spec
 
@@ -104,4 +104,4 @@ class TestThreadedExecution(BaseTest):
                 continue
             # Even through the script tasks sleep for .1 second, the difference in start times
             # should be less than 0.001 seconds - they should all start at the same time.
-            assert (last_task.start_in_seconds - task_model.start_in_seconds) < 0.001  # type: ignore
+            assert (last_task.start_in_seconds - task_model.start_in_seconds) < 0.001

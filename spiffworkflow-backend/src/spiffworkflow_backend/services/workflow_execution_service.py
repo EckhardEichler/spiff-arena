@@ -41,8 +41,10 @@ from spiffworkflow_backend.models.task import TaskModel  # noqa: F401
 from spiffworkflow_backend.models.user import UserModel
 from spiffworkflow_backend.services.assertion_service import safe_assertion
 from spiffworkflow_backend.services.jinja_service import JinjaService
+from spiffworkflow_backend.services.logging_service import LoggingService
 from spiffworkflow_backend.services.process_instance_lock_service import ProcessInstanceLockService
 from spiffworkflow_backend.services.process_instance_tmp_service import ProcessInstanceTmpService
+from spiffworkflow_backend.services.process_model_service import ProcessModelService
 from spiffworkflow_backend.services.task_service import StartAndEndTimes
 from spiffworkflow_backend.services.task_service import TaskService
 
@@ -323,21 +325,36 @@ class TaskModelSavingDelegate(EngineStepDelegate):
             # NOTE: used with process-all-tasks and process-children-of-last-task
             task_model = self.task_service.update_task_model_with_spiff_task(spiff_task)
             if self.current_task_start_in_seconds is None:
-                raise Exception("Could not find cached current_task_start_in_seconds. This should never have happend")
+                raise Exception("Could not find cached current_task_start_in_seconds. This should never have happened")
             task_model.start_in_seconds = self.current_task_start_in_seconds
             task_model.end_in_seconds = time.time()
 
+        metadata = ProcessModelService.extract_metadata(
+            self.process_instance.process_model_identifier,
+            spiff_task.data,
+        )
+        log_extras = {
+            "task_id": str(spiff_task.id),
+            "task_spec": spiff_task.task_spec.name,
+            "bpmn_name": spiff_task.task_spec.bpmn_name,
+            "process_model_identifier": self.process_instance.process_model_identifier,
+            "process_instance_id": self.process_instance.id,
+            "metadata": metadata,
+        }
         if (
             spiff_task.task_spec.__class__.__name__ in ["StartEvent", "EndEvent", "IntermediateThrowEvent"]
             and spiff_task.task_spec.bpmn_name is not None
         ):
             self.process_instance.last_milestone_bpmn_name = spiff_task.task_spec.bpmn_name
+            log_extras["milestone"] = spiff_task.task_spec.bpmn_name
         elif spiff_task.workflow.parent_task_id is None:
             # if parent_task_id is None then this should be the top level process
             if spiff_task.task_spec.__class__.__name__ == "EndEvent":
                 self.process_instance.last_milestone_bpmn_name = "Completed"
             elif spiff_task.task_spec.__class__.__name__ == "StartEvent":
                 self.process_instance.last_milestone_bpmn_name = "Started"
+
+        LoggingService.log_event(ProcessInstanceEventType.task_completed.value, log_extras)
         self.process_instance.task_updated_at_in_seconds = round(time.time())
         self._last_completed_spiff_task = spiff_task
         if self.secondary_engine_step_delegate:
@@ -509,6 +526,7 @@ class WorkflowExecutionService:
         save: bool = False,
         should_schedule_waiting_timer_events: bool = True,
         profile: bool = False,
+        needs_dequeue: bool = True,
     ) -> TaskRunnability:
         if profile:
             import cProfile
@@ -516,19 +534,22 @@ class WorkflowExecutionService:
 
             task_runnability = TaskRunnability.unknown_if_ready_tasks
             with cProfile.Profile() as pr:
-                task_runnability = self._run_and_save(exit_at, save, should_schedule_waiting_timer_events)
+                task_runnability = self._run_and_save(
+                    exit_at, save, should_schedule_waiting_timer_events, needs_dequeue=needs_dequeue
+                )
             pr.print_stats(sort=SortKey.CUMULATIVE)
             return task_runnability
 
-        return self._run_and_save(exit_at, save, should_schedule_waiting_timer_events)
+        return self._run_and_save(exit_at, save, should_schedule_waiting_timer_events, needs_dequeue=needs_dequeue)
 
     def _run_and_save(
         self,
         exit_at: None = None,
         save: bool = False,
         should_schedule_waiting_timer_events: bool = True,
+        needs_dequeue: bool = True,
     ) -> TaskRunnability:
-        if self.process_instance_model.persistence_level != "none":
+        if needs_dequeue and self.process_instance_model.persistence_level != "none":
             with safe_assertion(ProcessInstanceLockService.has_lock(self.process_instance_model.id)) as tripped:
                 if tripped:
                     raise AssertionError(
@@ -662,7 +683,7 @@ class WorkflowExecutionService:
                 user_id=self.process_instance_model.process_initiator_id,
                 message_type="receive",
                 name=event.name,
-                correlation_keys=self.bpmn_process_instance.correlations,
+                correlation_keys=event.correlations,
             )
             for correlation_property in event.value:
                 message_correlation = MessageInstanceCorrelationRuleModel(
